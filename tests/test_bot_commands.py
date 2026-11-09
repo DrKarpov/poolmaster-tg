@@ -402,6 +402,17 @@ def test_application_does_not_register_web_app_updates(tmp_path, monkeypatch):
             pass
 
     class CapturingBuilder:
+        def concurrent_updates(self, processor):
+            self.processor=processor
+            return self
+
+        def connection_pool_size(self, size):
+            self.pool_size=size
+            return self
+
+        def pool_timeout(self, timeout):
+            return self
+
         def token(self, _token):
             return self
 
@@ -420,6 +431,8 @@ def test_application_does_not_register_web_app_updates(tmp_path, monkeypatch):
 
     bot.run()
 
+    assert builder.processor.max_concurrent_updates == 16
+    assert builder.pool_size == 32
     commands = {
         command
         for handler in builder.application.handlers

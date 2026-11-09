@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
@@ -10,10 +11,13 @@ import httpx
 MEXC_SPOT_BASE_URL = "https://api.mexc.com/api/v3"
 MEXC_SPOT_SYMBOL = "JETTONUSDT"
 MEXC_INTERVAL_SECONDS = {
+    "30m": 30 * 60,
     "5m": 5 * 60,
     "15m": 15 * 60,
     "60m": 60 * 60,
     "4h": 4 * 60 * 60,
+    "1d": 86400,
+    "1W": 604800,
 }
 
 
@@ -103,9 +107,33 @@ def _timestamp_seconds(value: Any, field: str) -> int:
     return value // 1000
 
 
+def period_end(open_time: int, source_interval: str) -> int:
+    """Validate a candle's UTC anchor and return its logical period end.
+
+    Monthly source close_time may be nominal +30d; calendar spacing is derived
+    from open times instead, preserving the original close_time for inspection.
+    """
+    if source_interval == '1M':
+        start = datetime.fromtimestamp(open_time, timezone.utc)
+        if start.day != 1 or any((start.hour, start.minute, start.second)):
+            raise ChartSourceInvalidResponse('MEXC monthly candle is not UTC calendar aligned')
+        return int(start.replace(year=start.year + (start.month == 12),
+                                 month=start.month % 12 + 1).timestamp())
+    seconds = MEXC_INTERVAL_SECONDS.get(source_interval)
+    if seconds is None:
+        raise ValueError(f"unsupported MEXC spot interval: {source_interval}")
+    if source_interval == '1W':
+        start = datetime.fromtimestamp(open_time, timezone.utc)
+        aligned = start.weekday() == 0 and not any((start.hour, start.minute, start.second))
+    else:
+        aligned = open_time % seconds == 0
+    if not aligned:
+        raise ChartSourceInvalidResponse('MEXC kline timestamp does not match its interval')
+    return open_time + seconds
+
+
 def normalize_mexc_klines(payload: Any, source_interval: str) -> list[MexcSpotCandle]:
-    interval_seconds = MEXC_INTERVAL_SECONDS.get(source_interval)
-    if interval_seconds is None:
+    if source_interval not in MEXC_INTERVAL_SECONDS and source_interval != '1M':
         raise ValueError(f"unsupported MEXC spot interval: {source_interval}")
     if not isinstance(payload, list):
         raise ChartSourceInvalidResponse("MEXC kline response is not a list")
@@ -118,7 +146,11 @@ def normalize_mexc_klines(payload: Any, source_interval: str) -> list[MexcSpotCa
             raise ChartSourceInvalidResponse("MEXC kline row does not match the documented eight-field schema")
         open_time = _timestamp_seconds(row[0], "open time")
         close_time = _timestamp_seconds(row[6], "close time")
-        if open_time % interval_seconds or close_time - open_time != interval_seconds:
+        expected_end = period_end(open_time, source_interval)
+        allowed_closes = {expected_end}
+        if source_interval == '1M':
+            allowed_closes.add(open_time + 30 * 86400)
+        if close_time not in allowed_closes:
             raise ChartSourceInvalidResponse("MEXC kline timestamp does not match its interval")
         open_price = _decimal(row[1], "open")
         high_price = _decimal(row[2], "high")
@@ -145,7 +177,7 @@ def normalize_mexc_klines(payload: Any, source_interval: str) -> list[MexcSpotCa
     for previous, current in zip(candles, candles[1:]):
         if current.open_time == previous.open_time:
             raise ChartSourceInvalidResponse("MEXC kline response contains duplicate candles")
-        if current.open_time - previous.open_time != interval_seconds:
+        if current.open_time != period_end(previous.open_time, source_interval):
             raise ChartSourceInvalidResponse("MEXC kline response contains a time gap")
     return candles
 

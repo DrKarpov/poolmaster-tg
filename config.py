@@ -98,6 +98,12 @@ class Settings:
     chart_cache_dir: Path
     chart_stale_max_age_seconds: int
     delete_command_messages: bool
+    farming_widgets_enabled: bool = False
+    price_widgets_enabled: bool = False
+    price_widget_queries_enabled: bool = False
+    price_widget_beta_updates: bool = False
+    coin_widgets_enabled: bool = False
+    update_concurrency: int = 16
 
 
 def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
@@ -140,4 +146,10 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
         chart_cache_dir=_read_path(values, "CHART_CACHE_DIR", "data/chart_cache"),
         chart_stale_max_age_seconds=_read_int(values, "CHART_STALE_MAX_AGE_SECONDS", 1800, minimum=1),
         delete_command_messages=_read_bool(values, "DELETE_COMMAND_MESSAGES", False),
+        farming_widgets_enabled=_read_bool(values, "FARMING_WIDGETS_ENABLED", False),
+        price_widgets_enabled=_read_bool(values, "PRICE_WIDGETS_ENABLED", False),
+        price_widget_queries_enabled=_read_bool(values, "PRICE_WIDGET_QUERIES_ENABLED", False),
+        price_widget_beta_updates=_read_bool(values, "PRICE_WIDGET_BETA_UPDATES", False),
+        coin_widgets_enabled=_read_bool(values, "COIN_WIDGETS_ENABLED", False),
+        update_concurrency=_read_int(values, "UPDATE_CONCURRENCY", 16, minimum=1),
     )

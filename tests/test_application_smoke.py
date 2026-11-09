@@ -177,9 +177,16 @@ def test_real_ptb_lifecycle_routes_private_start_and_callback_without_network(tm
     telegram_request = OfflineTelegramRequest()
     updates_request = OfflineTelegramRequest()
 
+    class OfflineBuilder(RealApplicationBuilder):
+        # A synthetic BaseRequest has no HTTP connection pool to configure.
+        def connection_pool_size(self, size):
+            return self
+        def pool_timeout(self, timeout):
+            return self
+
     def offline_builder():
         return (
-            RealApplicationBuilder()
+            OfflineBuilder()
             .request(telegram_request)
             .get_updates_request(updates_request)
         )

@@ -3,90 +3,74 @@
 [![CI](https://github.com/DrKarpov/poolmaster-tg/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/DrKarpov/poolmaster-tg/actions/workflows/ci.yml)
 [![Source Review Only](https://img.shields.io/badge/license-Source%20Review%20Only-gray)](LICENSE.md)
 
-Telegram bot for JETTON market data, DeFi farming analytics, historical yield charts, and personal alerts.
+[Русский](README.ru.md) · [Open the bot](https://t.me/JETTONPOOL_BOT)
 
-## Overview
+Telegram bot for JETTON market data, DeFi farming analytics, historical yield charts and personal alerts. The v1.1.0 source-review update adds interactive Telegram message widgets and bounded concurrent user processing.
 
-POOLMASTER is a Telegram bot with private menus, group commands, inline results, and charts rendered by the bot. It reads market and farming data from public APIs and stores user preferences and farming history locally. It has no web frontend, Mini App, wallet integration, or exchange trading.
+**Publicly visible, not open source.** Operational use, execution, deployment, modification and redistribution require prior written permission. See [LICENSE.md](LICENSE.md).
 
 ## Preview
 
-### Price chart
+### Interactive price chart
 
-![POOLMASTER price chart](docs/assets/price-chart.png)
+![Price widget](docs/assets/widgets/price.png)
 
-A MEXC Spot chart with candles, volume, moving average, and UTC timestamps.
+MEXC Spot candles, USDT volume and MA7. Six in-widget timeframes: 30m, 1h, 4h, 1D, 1W and a calendar month. Drag the plot to browse history; drag the time band to change horizontal scale. Tap a candle for UTC time and OHLC. Refresh updates the quote and 24-hour caption; Back returns to the menu. Browsing history does not replace the current quote with an old candle close.
 
-### Farming analytics
+### Weekly farming history
 
-![POOLMASTER farming analytics](docs/assets/farming-chart.png)
+![Weekly farming widget](docs/assets/widgets/farming.png)
 
-Weekly farming-yield history for the configured DeDust and STON.fi pools.
+Four DeDust/STON.fi series, current equal-weight mean and combined TVL. Tap a weekly point for pool values; tap it or the detail card again to close. All available weekly points fit without dragging. Refresh updates the sources and the same message. [Selected-week example](docs/assets/widgets/farming-detail.png).
 
-## Features
+### Coin menu
 
-- MEXC `JETTONUSDT` market data and server-rendered 1h / 12h charts.
-- DeDust and STON.fi farming yields and total value locked where available.
-- Persisted farming observations and completed-week history charts.
-- Personal price and farming alerts with per-user preferences.
-- Telegram inline price and farming summaries.
-- `/price` and `/farming` group commands.
-- Admin tools for broadcasts and managed channel/group publications.
-- Russian and English private interface.
+![Gold coin menu](docs/assets/widgets/coin.png)
+
+Tap to toss a gold coin: marked face or blank reverse, 50/50, with reflection, variable rotation speed, whole-coin bounce and optional haptics. No wagers, statistics or bot request per toss. The public source uses the approved TST vector instead of the private crown.
+
+Illustrations are browser renders of the shipped interface with saved market observations, not live quotes or screenshots of private conversations. Original logos and the related ticker are blurred. Public-source branding differs as documented in [Provenance](PROVENANCE.md).
+
+## Features and scope
+
+- Private price/farming widgets, Russian and English interface, personal alert preferences.
+- Persisted confirmed daily farming observations and completed-week summaries; missing observations are not invented.
+- Current farming mean is distinct from the mean over historical weeks; an observed 0% remains valid data.
+- Independent per-user/message queues with configurable active concurrency and shared bounded source caches.
+- Group `/price` and `/farming` retain legacy charts; inline results remain text summaries.
+- Administrator broadcasts, managed channel/group publication and access checks.
+- Legacy fallback when widget delivery is explicitly unsupported. Widget flags default off in source configuration.
+
+Daily/three-day farming views and group inline widgets are not enabled. The owner's phone and Windows Telegram Desktop 7.4.1 were checked; this is not a guarantee for every Telegram client/version.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    TG[Telegram Bot API] <--> PM[POOLMASTER]
-    PM --> M[MEXC]
-    PM --> D[DeDust]
-    PM --> S[STON.fi]
-    PM --> ST[Local state and farming history]
-    PM --> CR[Chart renderer]
+    TG[Telegram users] <--> BOT[Single bot poller and keyed queues]
+    BOT <--> W[Client message widgets]
+    BOT --> SNAP[Validated data and bounded caches]
+    SNAP --> API[MEXC / DeDust / STON.fi]
+    BOT --> STATE[Private JSON and SQLite state]
+    BOT --> PNG[Legacy chart renderers]
 ```
 
-Market and farming API calls are read-only. See [Architecture](docs/ARCHITECTURE.md) and [Data sources](docs/DATA_SOURCES.md) for details.
+HTML/Canvas runs inside Telegram messages. There is no separately hosted frontend, Mini App, public webhook, wallet integration or order execution. Market API access is read-only. See [Architecture](docs/ARCHITECTURE.md), [Widgets](docs/TELEGRAM_WIDGETS.md) and [Data sources](docs/DATA_SOURCES.md).
 
-## Data reliability
+## Documentation
 
-The application checks source identity, response shape, and data freshness. It bounds and labels stale display fallbacks, confirms large anomalies with another sample, and records only confirmed fresh farming observations in history. See [Data sources](docs/DATA_SOURCES.md) and [Farming history](docs/FARMING_HISTORY.md).
+[User guide](docs/USER_GUIDE.md) · [Administrator guide](docs/ADMIN_GUIDE.md) · [Configuration](docs/CONFIGURATION.md) · [Farming history](docs/FARMING_HISTORY.md) · [Testing](docs/TESTING.md) · [Changelog](CHANGELOG.md)
 
-## Local development
+The technical setup and test commands are documented for separately authorized reviewers/maintainers; they do not expand the license. Python 3.12 and Node 22 are used by CI. Widget templates are committed; Node/Terser are development tools, not bot runtime dependencies.
 
-Python 3.12 is used by CI. Create an isolated environment and install the development requirements:
+## Security and provenance
 
-```bash
-python3.12 -m venv .venv
-.venv/bin/python -m pip install -r requirements-dev.txt
-cp .env.example .env
-```
+Credentials, user preferences, destination records, widget sessions and runtime databases remain private and outside Git. Tests use synthetic identifiers and mocked transports. See [Security](SECURITY.md).
 
-Use a dedicated test bot token for a local run. **Do not use production credentials for local development.** Keep `.env` private and do not commit it. Start the bot with `.venv/bin/python bot.py` only when a dedicated test token is configured.
+This repository is an independent source-review snapshot derived from a stable private release. Private Git history, operational reports, original logo assets and deployment material are excluded. Approved compatibility differences are enumerated in [Provenance](PROVENANCE.md); byte-for-byte production identity is not claimed.
 
-Run the automated checks with dotenv loading disabled:
+## License and disclaimer
 
-```bash
-PYTHONPATH=. PYTHON_DOTENV_DISABLED=true .venv/bin/python -m pytest -q
-.venv/bin/python -m compileall -q .
-.venv/bin/python -m pip check
-git diff --check
-```
+**This software is NOT open source.** The [POOLMASTER Source Review License v1.0](LICENSE.md) governs access and use. See [Notice](NOTICE.md), [Third-party notices](THIRD_PARTY_NOTICES.md) and [Contributing](CONTRIBUTING.md).
 
-More detail is in [Configuration](docs/CONFIGURATION.md) and [Testing](docs/TESTING.md).
-
-## Security
-
-The application does not use exchange API keys or wallet keys. Telegram credentials, administrator IDs, user preferences, destination settings, and runtime state must remain private and outside Git. External market calls are read-only. See [Security](SECURITY.md).
-
-## Public repository scope
-
-This is a public source snapshot derived from POOLMASTER v1.0.0 for portfolio and technical review. It includes a minimal public-only compatibility change so charts render when private branding assets are absent. Private branding and deployment-specific assets are intentionally excluded; this snapshot is not a byte-for-byte copy of the private production tree.
-
-## License
-
-**This software is NOT open source.** The source is publicly visible for review and portfolio evaluation only. Use, deployment, modification, redistribution, derivative works, incorporation into another product, and commercial or non-commercial operational use require prior explicit written permission. See [POOLMASTER Source Review License v1.0](LICENSE.md).
-
-## Disclaimer
-
-Market and yield information is informational and is not investment or financial advice. Third-party data may be delayed, unavailable, or incorrect. The software does not control funds or place trades and is provided without warranty. See [Disclaimer](DISCLAIMER.md).
+Market and yield data is informational, not investment advice. Sources may be unavailable, delayed or incorrect. The bot does not control funds or place trades. See [Disclaimer](DISCLAIMER.md).

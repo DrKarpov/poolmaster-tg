@@ -294,6 +294,16 @@ class FarmingHistoryStore:
             logging.exception("Failed to persist confirmed farming history")
             raise
 
+    def has_confirmed_day(self, day: date) -> bool:
+        """Whether fresh API observations for all four pools reached storage."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT series_key FROM observations WHERE date_utc = ? "
+                "AND cadence = 'daily confirmed farming refresh'",
+                (day.isoformat(),),
+            ).fetchall()
+        return set(SERIES_KEY_ORDER).issubset(row[0] for row in rows)
+
     def get_summary(self, as_of: datetime | None = None) -> FarmingHistorySummary:
         """Return completed UTC Monday–Sunday week means, preserving missing weeks."""
         reference = _utc_datetime(as_of or datetime.now(timezone.utc))

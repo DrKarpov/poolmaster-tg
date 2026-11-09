@@ -16,3 +16,7 @@ The global automatic user-alert pause and managed-destination schedules are inde
 New connections are verified against Telegram chat identity and the bot's effective posting rights. Rights loss disables the destination schedule; restoring rights does not enable it again automatically. An administrator must explicitly reconnect and choose a schedule.
 
 See [Configuration](CONFIGURATION.md) and [Security](../SECURITY.md).
+
+## Widgets and workload
+
+Private widgets and the coin menu do not grant administrator rights. Existing broadcast and destination confirmations remain. Per-user/message queues permit independent work, while UPDATE_CONCURRENCY bounds active handlers. Alert pause and destination schedules retain their separate meaning. Do not use public CI fixtures to configure production.

@@ -15,3 +15,9 @@ The configured pool identities are application constants. Responses are checked 
 The application distinguishes usable, partial, unavailable, timed-out, and invalid responses. A fresh primary farming yield may remain usable when an auxiliary value such as TVL is unavailable. Stale fallback data is bounded by configured maximum age and labeled stale; it is not used for alerts or confirmed farming-history observations.
 
 Large price and farming changes are checked against a second sample before replacing the accepted value. Failed or inconsistent confirmation does not silently promote the new value. Source APIs can change schema or availability, and reported yields are not promises of future returns.
+
+## Widget data
+
+Price widgets validate timeframe-aligned MEXC OHLCV and use bounded latest/history caches with shared in-flight loads. The 1M frame follows calendar months. Current quote/24-hour metrics are separate from the selected historical candle; only explicit refresh accepts a new quote. Background reserve reads do not edit the displayed message state.
+
+Farming widgets derive weekly history from saved confirmed observations and current mean/complete TVL from accepted source metrics. They preserve confirmed zero rates and missing values. Retryable daily collection checks actual writes for every pool; stale caches never satisfy live daily coverage. See [Farming history](FARMING_HISTORY.md).

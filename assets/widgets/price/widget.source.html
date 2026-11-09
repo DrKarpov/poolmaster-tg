@@ -1,0 +1,50 @@
+<style>body{margin:0;background:#091818;color:#F3F8FA;font:12px system-ui;padding:6px}#card{background:#1B2744;border:1px solid #14A7E8;border-radius:12px;padding:10px}header{display:flex;align-items:center;gap:7px;flex-wrap:wrap}#p{margin-left:auto;color:#B8E800}nav{display:flex;gap:2px;margin:9px 0;border-bottom:1px solid #35415B;padding-bottom:6px}button{background:none;border:1px solid #35415B;border-radius:4px;color:#C1CDD2;padding:6px 0;flex:1;font:11px system-ui}button.on{color:#091818;background:#14A7E8}#i{font:10px monospace;color:#C1CDD2}canvas{display:block;width:100%;height:268px;touch-action:pan-y}footer{color:#C1CDD2;font-size:10px;margin-top:6px}#s{color:#D98E8E;margin-left:4px}#s.ok{color:#B8E800}#s.copy{color:#C1CDD2}#s.pending{color:#14A7E8;animation:pulse .8s infinite}@keyframes pulse{50%{opacity:.2}}</style><div id=card><header><b>JETTON POOL MASTER</b><b id=p></b></header><nav id=f></nav><div id=i></div><canvas id=c></canvas><footer>MEXC Spot · JETTONUSDT · UTC · <span style="color:#E6C97A">MA7</span> · USDT<span id=s class=copy>●</span></footer></div><script>
+const T=window.TelegramWidget,I=__QUERY__,$=id=>document.getElementById(id),C=$('c'),X=C.getContext('2d'),F='30m 1h 4h 1d 1w 1M'.split(' '),N=JSON.parse(T.publicData).k?.split(' ')||F;let A={},B={},D=[],R=0,n=24,busy=0,down=null,pick=-1,last=0,zooms={},deferred=null,paint=0,next=0,queued="",pre=0,halt=0;
+function signal(code){$('s').className=code||'ok'}
+try{zooms=JSON.parse(localStorage.getItem('view'))?.z||{}}catch{}
+function num(v,k){return v[0]=='~'?Number(v.slice(1)):parseInt(v,36)/10**k}
+function controls(){[...$('f').children].forEach((b,j)=>{b.className=F[j]==A.f?'on':'';b.disabled=busy&&busy!=2||!A.r||(!I||A.i==0)});schedule()}
+F.forEach((v,j)=>{let b=document.createElement('button');b.textContent=N[j];b.onclick=()=>ask('tf:'+v);$('f').appendChild(b)});let fresh=document.createElement('button');fresh.textContent='↻';fresh.onclick=()=>ask('refresh');$('f').appendChild(fresh);
+function schedule(){if(busy)return;clearTimeout(pre);if(!T||!I||A.i==0||down||document.hidden)return;if(queued||!halt&&B.h&&R<Math.min(120,n+24))pre=setTimeout(()=>{let q=queued||'history:'+D[0][0];queued='';ask(q)},Math.max(0,next-Date.now()))}
+function ask(action){if(!T||!I||A.i==0)return;if(busy){if(busy==2){queued=action;signal('pending')}return}clearTimeout(pre);queued='';let history=action[0]=='h',revision=A.r;busy=history?2:1;next=Date.now()+5200;if(!history){halt=0;signal('pending')};controls();try{T.request('p1:'+action+':'+A.r).then(v=>{busy=0;let z;try{z=JSON.parse(v.result||'{}')}catch{}if(history){if(z?.r==A.r&&revision==A.r){if(z.c)state({...A,...z,c:'',l:0},{...B,...z,n});else B.h=0}else halt=1}else if(z?.revision)busy=A.r<z.revision?-z.revision:0;else signal(z?.status||'error');controls()},fail)}catch{fail()}pre=setTimeout(()=>{if(busy<0)fail()},16000)}
+function fail(){busy=0;halt=1;signal('error');controls()}
+function state(a,b){try{a??=JSON.parse(T.publicData);b??=JSON.parse(T.chatData);if(b&&(a.v!=1||a.r!=b.r||a.t!=b.t||a.f!=b.f||a.r<(A.r||0)))return;if(down){deferred=[a,b];return}if(!b||a.e=='expired'){A=a;A.i=0;B=b||{};D=[];R=last=busy=0;clearTimeout(pre);C.width=C.width;$('p').textContent=b?'':a.q||'';$('i').textContent=b?'':iso(a.a).slice(0,16);signal(b?'expired':'copy');controls();return}let rows=(a.c+';'+b.c).split(';').filter(Boolean).map(s=>{let v=s.split(',');return[a.t+parseInt(v[0],36),...v.slice(1).map((x,j)=>num(x,a.s[j>>2]))]});let edge=D[R-1]?.[0],frame=A.f==a.f,same=frame&&A.u==a.u,atTail=R==D.length,older=rows[0][0]<D[0]?.[0];if(!frame)last=0;if(a.l!=0)last=Math.max(last,rows[rows.length-1][0]);if(same){rows=[...new Map([...D,...rows].map(x=>[x[0],x])).values()].sort((x,y)=>x[0]-y[0]);rows=older&&!atTail?rows.slice(0,120):rows.slice(-120)}D=rows;if(!frame)n=(zooms[a.f]=zooms[a.f]>=8&&zooms[a.f]<=96?+zooms[a.f]:0)||b.n;R=D.length;if(same&&edge&&!(atTail&&a.l!=0))R=index(edge)+1;R=limit(R);A=a;B=b;if(busy<0&&a.r>=-busy)busy=0;$('p').textContent=a.q;signal(queued||busy&&busy!=2?'pending':a.e);pick=-1;flush();persist();controls()}catch{}}
+const iso=t=>new Date(t*1000).toJSON();
+function axis(bars,span,step){
+ let first=bars[0][0],extent=bars[bars.length-1][0]-first,dates=extent>=172800,months=A.f=='1M'||extent>7776000,count=Math.max(1,Math.min(6,span/56|0));
+ let stride=(months?[1,2,3,6,12]:[.5,1,2,3,6,12,24,48,72,168,336,672]).find(v=>v>=extent/(months?2592000:3600)/(count+1)*.8)||12;
+ if(!months)stride=Math.max(stride*3600,(bars[1]?.[0]||first+1800)-first,dates?86400:0);
+ let ticks=[],year;
+ bars.forEach((v,j)=>{
+  let d=iso(v[0]),m=+d.slice(5,7)-1,day=+d.slice(8,10),mid=v[0]%86400==0,y=+d.slice(0,4),turn=year&&year!=y;year=y;
+  if(!turn&&!(months?day<=(A.f=='1w'?7:1)&&mid&&(y*12+m)%stride==0:(v[0]-(stride>=604800?345600:0))%stride==0)&&!(j==bars.length-1&&!ticks.length))return;
+  let p=months||mid||dates,label=turn||p&&m==0&&(months||day==1)?(p=2,''+y):p?(months?'':day+' ')+(N[m+6]||m+1):iso(v[0]).slice(11,16);
+  let width=label.length*6.2,x=Math.max(0,Math.min(span-width,(j+.5)*step-width/2));
+  let prev;while((prev=ticks[ticks.length-1])&&x<prev[0]+prev[3]+12){if(p<=prev[2])return;ticks.pop()}
+  ticks.push([x,label,p,width]);
+ });
+ ticks.forEach(t=>X.fillText(t[1],t[0],251));
+}
+function draw(){
+ if(!D.length)return;
+ let w=C.getBoundingClientRect().width,d=Math.min(window.devicePixelRatio||1,2);if(w<100)return;if(!zooms[A.f])n=Math.min(n,Math.max(8,((w-65)/4|0)));
+ C.width=w*d;C.height=268*d;X.setTransform(d,0,0,d,0,0);
+ let left=Math.max(0,R-n),bars=D.slice(left,R),hi=Math.max(...bars.map(x=>x[2])),lo=Math.min(...bars.map(x=>x[3])),range=hi-lo||hi*.01,span=w-65,step=span/bars.length,y=v=>18+(hi-v)/range*166,maxv=Math.max(...bars.map(x=>x[5]),1);
+ X.font='10px monospace';
+ for(let j=0;j<4;j++){let yy=18+j*166/3;X.fillStyle='#35415B';X.fillRect(0,yy,span,1);X.fillStyle='#C1CDD2';X.fillText((hi-range*j/3).toFixed(5),span+3,yy+4)}
+ bars.forEach((v,j)=>{let x=j*step+step/2;X.fillStyle=v[4]>=v[1]?'#93C9A8':'#D98E8E';X.fillRect(x,y(v[2]),1,Math.max(1,y(v[3])-y(v[2])));X.fillRect(x-step*.3,Math.min(y(v[1]),y(v[4])),Math.max(1,step*.6),Math.max(1,Math.abs(y(v[4])-y(v[1]))));X.fillRect(x-step*.3,227-v[5]/maxv*32,Math.max(1,step*.6),v[5]/maxv*32)});
+
+ X.fillStyle='#22304B';X.fillRect(0,236,w,22);X.fillStyle='#35415B';X.fillRect(0,236,w,1);X.fillStyle='#C1CDD2';axis(bars,span,step);
+ X.beginPath();X.rect(0,18,span,166);X.clip();X.strokeStyle='#E6C97A';X.beginPath();bars.forEach((v,j)=>{let k=left+j;if(k<6)return;let ma=D.slice(k-6,k+1).reduce((s,x)=>s+x[4],0)/7;let x=j*step+step/2;j&&k>6?X.lineTo(x,y(ma)):X.moveTo(x,y(ma))});X.stroke();
+ let v=bars[Math.min(bars.length-1,pick<0?bars.length-1:pick)];$('i').textContent=iso(v[0]).slice(0,16).replace('T',' ')+' UTC  O '+v[1]+' H '+v[2]+' L '+v[3]+' C '+v[4];zooms[A.f]=n;
+}
+function persist(){try{localStorage.setItem('view',JSON.stringify({v:2,z:zooms}))}catch{}}
+function redraw(){if(!paint)paint=requestAnimationFrame(()=>{paint=0;draw()})}
+function flush(){if(paint)cancelAnimationFrame(paint);paint=0;draw()}
+function index(t){return D.findIndex(v=>v[0]==t)}
+
+function limit(v){return Math.max(Math.min(n,D.length),Math.min(D.length,v))}
+C.onpointerdown=e=>{if(!busy)clearTimeout(pre);down={x:e.clientX,r:R,n,z:e.clientY-C.getBoundingClientRect().top>=232};C.setPointerCapture(e.pointerId)};C.onpointermove=e=>{if(!down)return;let dx=e.clientX-down.x;if(Math.abs(dx)>10){if(down.z){n=Math.max(8,Math.min(96,down.n-(dx/3|0)));let j=index(last);if(j>=0)R=j+1}else R=limit(down.r-(dx/Math.max(4,(C.clientWidth-65)/Math.min(n,D.length||n))|0));pick=-1;redraw()}};function end(e,cancel){if(!down)return;let dx=e.clientX-down.x,z=down.z,drag=Math.abs(dx)>10;if(cancel){R=down.r;n=down.n}else if(!drag&&!z)pick=Math.floor((e.clientX-C.getBoundingClientRect().left)/((C.clientWidth-65)/Math.min(n,R)));down=null;if(deferred){let v=deferred;deferred=null;state(...v)}else{flush();if(!cancel)persist()}if(!cancel&&drag){halt=0;if(z&&index(last)<0)ask('latest')}schedule()}
+C.onpointerup=end;C.onpointercancel=e=>end(e,true);
+if(T){T.onEvent('publicDataChanged',state);T.onEvent('chatDataChanged',state);document.addEventListener('visibilitychange',schedule);state();T.ready()}new ResizeObserver(draw).observe(C);
+</script>

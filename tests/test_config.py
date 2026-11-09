@@ -5,6 +5,19 @@ from pathlib import Path
 import pytest
 
 
+def test_widget_flags_are_opt_in_and_beta_polling_separate():
+    from config import load_settings
+    defaults = load_settings({})
+    assert defaults.price_widgets_enabled is False
+    assert defaults.price_widget_queries_enabled is False
+    assert defaults.price_widget_beta_updates is False
+    enabled = load_settings({'PRICE_WIDGETS_ENABLED': 'true',
+                             'PRICE_WIDGET_QUERIES_ENABLED': 'true',
+                             'PRICE_WIDGET_BETA_UPDATES': 'true'})
+    assert enabled.price_widgets_enabled and enabled.price_widget_queries_enabled
+    assert enabled.price_widget_beta_updates
+
+
 def _configuration_module():
     try:
         return importlib.import_module("config")
@@ -161,3 +174,16 @@ def test_float_settings_reject_non_finite_values(key, value):
 
     with pytest.raises(ValueError, match=key):
         config.load_settings({"TELEGRAM_BOT_TOKEN": "synthetic-test-token", key: value})
+
+
+@pytest.mark.parametrize('value',['0','-1','invalid'])
+def test_update_work_limit_rejects_invalid_values(value):
+    from config import load_settings
+    with pytest.raises(ValueError,match='UPDATE_CONCURRENCY'):
+        load_settings({'UPDATE_CONCURRENCY':value})
+
+
+def test_update_work_limit_can_scale_with_server_capacity():
+    from config import load_settings
+    assert load_settings({}).update_concurrency==16
+    assert load_settings({'UPDATE_CONCURRENCY':'64'}).update_concurrency==64
