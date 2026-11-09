@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import tempfile
 import threading
 from collections.abc import Mapping, Sequence
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -36,6 +38,7 @@ def _default_user(user_id: int) -> dict[str, Any]:
         "last_seen_at": None,
         "blocked_at": None,
         "language": None,
+        "chart_preferences": {"timeframe": "1h"},
         "farming_enabled": False,
         "farming_change_threshold_pp": None,
         "farming_direction": "both",
@@ -64,6 +67,8 @@ class UserAlertStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        self._pending_registrations = []
+        self._registration_scheduled = False
         self._needs_migration_save = False
         self._data = self._load()
         if self._needs_migration_save:
@@ -110,6 +115,13 @@ class UserAlertStore:
             raise ValueError("user state contains an invalid user record")
 
         merged = {**_default_user(user_id), **record}
+        from chart_widget import ChartPreferences
+        prefs = merged.get('chart_preferences')
+        try:
+            frame = ChartPreferences(prefs.get('timeframe', '1h')).timeframe if isinstance(prefs, dict) else '1h'
+        except ValueError:
+            frame = '1h'
+        merged['chart_preferences'] = {'timeframe': frame}
         # A missing language field identifies a pre-language existing user.
         # Keep newly created records explicitly unset so they see onboarding.
         if "language" not in record:
@@ -267,6 +279,28 @@ class UserAlertStore:
     def _copy_json(value: Any) -> Any:
         return deepcopy(value)
 
+    @contextmanager
+    def _transaction(self, *user_ids: int):
+        """Keep failed mutations invisible; copy only touched user records."""
+        with self._lock:
+            previous = self._data
+            if user_ids:
+                candidate = dict(previous)
+                candidate['users'] = dict(previous['users'])
+                for user_id in user_ids:
+                    key = str(user_id)
+                    if key in candidate['users']:
+                        candidate['users'][key] = self._copy_json(previous['users'][key])
+            else:
+                # Legacy imports also update migration metadata and many users.
+                candidate = self._copy_json(previous)
+            self._data = candidate
+            try:
+                yield
+            except BaseException:
+                self._data = previous
+                raise
+
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         encoded = json.dumps(self._data, ensure_ascii=False, indent=2)
@@ -320,14 +354,19 @@ class UserAlertStore:
     def get_user(self, user_id: int, *, now: datetime | None = None) -> dict[str, Any]:
         with self._lock:
             record = self._data["users"].get(str(user_id))
-            if record is not None and self._clear_expired_pause_locked(record, now=now):
-                self._save()
-            return self._copy_json(record) if record is not None else _default_user(user_id)
+            if record is None:
+                return _default_user(user_id)
+            result = self._copy_json(record)
+            if self._clear_expired_pause_locked(result, now=now):
+                with self._transaction(user_id):
+                    self._data['users'][str(user_id)] = self._copy_json(result)
+                    self._save()
+            return result
 
     def ensure_user(self, user_id: int) -> dict[str, Any]:
         if user_id <= 0:
             raise ValueError("private user ID must be positive")
-        with self._lock:
+        with self._transaction(user_id):
             key = str(user_id)
             if key not in self._data["users"]:
                 self._data["users"][key] = _default_user(user_id)
@@ -337,11 +376,23 @@ class UserAlertStore:
     def set_language(self, user_id: int, language: str) -> dict[str, Any]:
         if language not in ("ru", "en"):
             raise ValueError("unsupported user language")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             user["language"] = language
             self._save()
             return self._copy_json(user)
+
+    def get_chart_preferences(self, user_id: int):
+        from chart_widget import ChartPreferences
+        return ChartPreferences(self.get_user(user_id).get('chart_preferences', {}).get('timeframe', '1h'))
+
+    def set_chart_preferences(self, user_id: int, preferences) -> None:
+        from chart_widget import ChartPreferences
+        validated = ChartPreferences(preferences.timeframe)
+        with self._transaction(user_id):
+            user = self._get_or_create_locked(user_id)
+            user['chart_preferences'] = {'timeframe': validated.timeframe}
+            self._save()
 
     @staticmethod
     def _user_observation_timestamp(observed_at: datetime | None) -> str:
@@ -356,23 +407,53 @@ class UserAlertStore:
         *,
         observed_at: datetime | None = None,
     ) -> dict[str, Any]:
-        user_id = getattr(user, "id", None)
-        if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
-            raise ValueError("only a positive private user ID can be registered")
-        timestamp = self._user_observation_timestamp(observed_at)
-        with self._lock:
-            record = self._get_or_create_locked(user_id)
-            record.update({
-                "registered": True,
-                "blocked": False,
-                "username": getattr(user, "username", None),
-                "first_name": getattr(user, "first_name", None),
-                "last_name": getattr(user, "last_name", None),
-                "first_seen_at": record.get("first_seen_at") or timestamp,
-                "last_seen_at": timestamp,
-            })
-            self._save()
-            return self._copy_json(record)
+        return self.register_private_users((user,),observed_at=observed_at)[0]
+
+    def register_private_users(self, users, *, observed_at=None):
+        prepared=[]
+        for user in users:
+            user_id=getattr(user,'id',None)
+            if type(user_id) is not int or user_id<=0:
+                raise ValueError('only a positive private user ID can be registered')
+            prepared.append((user_id,user))
+        timestamp=self._user_observation_timestamp(observed_at)
+        with self._transaction(*(user_id for user_id, _ in prepared)):
+            result=[]
+            for user_id,user in prepared:
+                record=self._get_or_create_locked(user_id)
+                record.update({
+                    'registered':True,'blocked':False,
+                    'username':getattr(user,'username',None),
+                    'first_name':getattr(user,'first_name',None),
+                    'last_name':getattr(user,'last_name',None),
+                    'first_seen_at':record.get('first_seen_at') or timestamp,
+                    'last_seen_at':timestamp,
+                })
+                result.append(self._copy_json(record))
+            if prepared:
+                self._save()
+            return result
+
+    async def reactivate_user_async(self, user):
+        """Coalesce simultaneous registry writes; return only after durable save."""
+        future=asyncio.get_running_loop().create_future()
+        self._pending_registrations.append((user,future))
+        if not self._registration_scheduled:
+            self._registration_scheduled=True
+            asyncio.get_running_loop().call_soon(self._flush_registrations)
+        return await future
+
+    def _flush_registrations(self):
+        pending,self._pending_registrations=self._pending_registrations,[]
+        self._registration_scheduled=False
+        try:
+            rows=self.register_private_users([user for user,_ in pending])
+        except Exception as error:
+            for _,future in pending:
+                if not future.done():future.set_exception(error)
+        else:
+            for (_,future),row in zip(pending,rows):
+                if not future.done():future.set_result(row)
 
     def reactivate_user(
         self,
@@ -387,7 +468,7 @@ class UserAlertStore:
         if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id <= 0:
             raise ValueError("only a positive private user ID can be blocked")
         timestamp = self._user_observation_timestamp(observed_at)
-        with self._lock:
+        with self._transaction(user_id):
             record = self._get_or_create_locked(user_id)
             record["blocked"] = True
             record["blocked_at"] = timestamp
@@ -426,7 +507,7 @@ class UserAlertStore:
             "subscribers": Path(subscribers_path) if subscribers_path is not None else None,
             "stats": Path(stats_path) if stats_path is not None else None,
         }
-        with self._lock:
+        with self._transaction():
             if migration_key in self._data["migrations"]:
                 return 0
             backups: dict[str, str] = {}
@@ -666,7 +747,7 @@ class UserAlertStore:
         enabled: bool = True,
     ) -> dict[str, Any]:
         threshold = self._validate_threshold(threshold_pp, MAX_YIELD_ALERT_PP, "yield threshold")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             user["farming_change_threshold_pp"] = str(threshold) if threshold is not None else None
             user["farming_enabled"] = bool(enabled and threshold is not None)
@@ -685,7 +766,7 @@ class UserAlertStore:
         enabled: bool = True,
     ) -> dict[str, Any]:
         threshold = self._validate_threshold(threshold_pct, MAX_PRICE_ALERT_PCT, "price threshold")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             user["price_threshold_pct"] = str(threshold) if threshold is not None else None
             user["price_enabled"] = bool(enabled and threshold is not None)
@@ -704,7 +785,7 @@ class UserAlertStore:
     ) -> dict[str, Any]:
         if kind not in {"price", "yield"}:
             raise ValueError("unknown alert kind")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             threshold_field = "price_threshold_pct" if kind == "price" else "farming_change_threshold_pp"
             enabled_field = "price_enabled" if kind == "price" else "farming_enabled"
@@ -732,7 +813,7 @@ class UserAlertStore:
     ) -> dict[str, Any]:
         if kind not in {"price", "yield"} or direction not in ALERT_DIRECTIONS:
             raise ValueError("invalid alert direction")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             field = "price_direction" if kind == "price" else "farming_direction"
             revision_field = "price_alert_revision" if kind == "price" else "yield_alert_revision"
@@ -754,7 +835,7 @@ class UserAlertStore:
         *,
         now: datetime | None = None,
     ) -> dict[str, Any]:
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             before_yield = self._copy_json(user.get("last_notified_yield", {}))
             before_price = user.get("price_baseline")
@@ -836,14 +917,14 @@ class UserAlertStore:
         if current.tzinfo is None:
             raise ValueError("pause timestamp must be timezone-aware")
         paused_until = current.astimezone(timezone.utc) + timedelta(hours=24)
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             user["paused_until"] = paused_until.isoformat()
             self._save()
         return paused_until
 
     def resume_user(self, user_id: int) -> dict[str, Any]:
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             user["paused_until"] = None
             self._save()
@@ -906,7 +987,7 @@ class UserAlertStore:
         timestamp = sent_at or datetime.now(timezone.utc)
         if timestamp.tzinfo is None or metric_kind not in {"APR", "APY"} or not source_field:
             raise ValueError("yield delivery requires a source metric and aware timestamp")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             if expected_revision is not None and user.get("yield_alert_revision") != expected_revision:
                 return False
@@ -935,7 +1016,7 @@ class UserAlertStore:
     ) -> bool:
         if sent_at.tzinfo is None:
             raise ValueError("delivery timestamp must be timezone-aware")
-        with self._lock:
+        with self._transaction(user_id):
             user = self._get_or_create_locked(user_id)
             if expected_revision is not None and user.get("price_alert_revision") != expected_revision:
                 return False
@@ -954,17 +1035,11 @@ class UserAlertStore:
     def record_manual_farming_push(self, user_id: int, fingerprint: str, sent_at: datetime) -> None:
         if sent_at.tzinfo is None or not fingerprint:
             raise ValueError("manual farming push requires a fingerprint and aware timestamp")
-        with self._lock:
-            self._get_or_create_locked(user_id)
-            previous = self._copy_json(self._data)
-            user = self._data["users"][str(user_id)]
+        with self._transaction(user_id):
+            user = self._get_or_create_locked(user_id)
             user["last_manual_farming_push_fingerprint"] = fingerprint
             user["last_manual_farming_push_at"] = sent_at.astimezone(timezone.utc).isoformat()
-            try:
-                self._save()
-            except Exception:
-                self._data = previous
-                raise
+            self._save()
 
     @staticmethod
     def _remember_fingerprint(user: dict[str, Any], fingerprint: str) -> None:

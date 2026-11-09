@@ -434,7 +434,14 @@ def test_manual_broadcast_preview_and_confirm_preserve_content_entities_and_admi
     confirm_data = next(button.callback_data for button in preview_buttons if button.text == "Отправить всем")
     confirm_update, confirm_query, _confirm_message = _update(111, data=confirm_data)
     confirm_query.message.message_id = 900
-    asyncio.run(bot.admin_ui_callback(confirm_update, context))
+    async def confirm_and_drain():
+        tasks=[]
+        def schedule(coroutine,**kwargs):
+            task=asyncio.create_task(coroutine);tasks.append(task);return task
+        context.application=SimpleNamespace(create_work_task=schedule)
+        await bot.admin_ui_callback(confirm_update,context)
+        await asyncio.gather(*tasks)
+    asyncio.run(confirm_and_drain())
 
     assert len(telegram.copies) == 1
     assert telegram.copies[0] == {
@@ -1146,3 +1153,40 @@ def test_users_export_callback_sends_registered_private_users_as_csv_only_to_adm
 def test_removed_legacy_push_farming_command_has_no_handler_method(tmp_path, monkeypatch):
     bot = _make_bot(tmp_path, monkeypatch)
     assert not hasattr(bot, "push_farming")
+
+
+def test_confirmed_broadcast_returns_immediately_and_rejects_overlapping_campaign(tmp_path,monkeypatch):
+    bot=_make_bot(tmp_path,monkeypatch)
+    async def run():
+        started=asyncio.Event();release=asyncio.Event();tasks=[];sent=[]
+        class Telegram:
+            async def send_message(self,**kwargs):
+                if kwargs['text']=='Concurrent broadcast':
+                    started.set();await release.wait()
+                sent.append(kwargs)
+        class WorkHost:
+            def create_work_task(self,coroutine,**kwargs):
+                task=asyncio.create_task(coroutine);tasks.append(task);return task
+        context=SimpleNamespace(bot=Telegram(),application=WorkHost(),user_data={})
+        previews=[]
+        for admin in (111,222):
+            bot.manual_push_coordinator.begin_input(actor_id=admin,admin_ids=bot.admin_ids)
+            previews.append(bot.manual_push_coordinator.create_preview(actor_id=admin,admin_ids=bot.admin_ids,
+                source_chat_id=admin,source_message_id=501,kind='text',text='Concurrent broadcast',caption=None,
+                recipient_count=2,now=datetime.now(timezone.utc)))
+        update,_,_=_update(111,data='admin:push:confirm:'+previews[0].token)
+        confirmation=asyncio.create_task(bot.admin_ui_callback(update,context))
+        try:
+            await asyncio.wait_for(asyncio.shield(confirmation),.3)
+            await asyncio.wait_for(started.wait(),1)
+            second,_,_=_update(222,data='admin:push:confirm:'+previews[1].token)
+            await bot.admin_ui_callback(second,context)
+            assert len(tasks)==1
+            assert any('уже выполняется' in message['text'] for message in sent)
+        finally:
+            release.set();await confirmation
+            if tasks:await asyncio.gather(*tasks)
+        deliveries=[v for v in sent if v['text']=='Concurrent broadcast']
+        assert [v['chat_id'] for v in deliveries]==[111,222]
+        assert sent[-1]['text']=='Отправлено: 2\nЗаблокировали бота: 0\nОшибки: 0'
+    asyncio.run(run())

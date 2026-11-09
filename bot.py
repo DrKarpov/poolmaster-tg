@@ -18,6 +18,7 @@ from datetime import datetime, time, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 from config import load_settings
+from update_processing import KeyedUpdateProcessor, callback_for_queue
 from telegram import (
     BotCommand,
     BotCommandScopeAllGroupChats,
@@ -88,6 +89,8 @@ from price import PriceIdentityCheck, fetch_price_metrics, verify_mexc_market_id
 from snapshot import DataSnapshot, SnapshotManager
 from state_backup import secure_backup_file
 from user_state import UserAlertStore
+from widget_transport import WidgetApiError, WidgetTransport, WidgetMessageContext
+from widget_updates import WidgetUpdatesRequest, WidgetQueryHandler, ChartWidgetQuery, parse_widget_query, raw_widget_query
 from user_ui import (
     USER_SCREENS,
     private_callback_is_owned,
@@ -189,6 +192,42 @@ class PoolmasterApplication(Application):
         super().__init__(**kwargs)
         self._background_task_factory = background_task_factory
         self._background_tasks: list[asyncio.Task[Any]] = []
+        self._work_tasks: set[asyncio.Task[Any]] = set()
+
+    def create_work_task(self, coroutine, *, update=None, name=None):
+        # These tasks also have to drain when admitted during Application.stop,
+        # after PTB has switched running=False and no longer tracks new tasks.
+        entered=False
+        async def run():
+            nonlocal entered
+            entered=True
+            try:
+                return await coroutine
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                await self.process_error(update=update,error=error)
+        task=asyncio.create_task(run(),name=name)
+        self._work_tasks.add(task)
+        def finished(done):
+            self._work_tasks.discard(done)
+            if not entered:
+                coroutine.close()
+            if not done.cancelled():
+                done.exception()  # retrieve any failure of the error handler
+        task.add_done_callback(finished)
+        return task
+
+    async def _drain_work(self):
+        if isinstance(self.update_processor,KeyedUpdateProcessor):
+            await self.update_processor.drain()
+        while self._work_tasks:
+            await asyncio.gather(*tuple(self._work_tasks),return_exceptions=True)
+
+    async def shutdown(self) -> None:
+        if not self.running:
+            await self._drain_work()
+        await super().shutdown()
 
     async def start(self) -> None:
         await super().start()
@@ -206,6 +245,7 @@ class PoolmasterApplication(Application):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         await super().stop()
+        await self._drain_work()
 
 
 async def telegram_call_with_retry(operation: Any, attempts: int = 2) -> Any:
@@ -357,6 +397,151 @@ def atomic_write_json(path: Path, data: dict[str, Any]) -> None:
 
 
 class PoolmasterBot:
+    async def try_open_coin_menu(self, chat_id: int, language: str) -> str:
+        if not self.settings.coin_widgets_enabled:
+            return 'legacy'
+        from coin_widget import send_coin_menu
+        try:
+            await send_coin_menu(WidgetTransport(self.token),chat_id,language)
+            return 'sent'
+        except WidgetApiError as exc:
+            logging.warning('Private coin menu failed kind=%s unknown=%s',exc.kind,exc.unknown)
+            return 'uncertain' if exc.unknown else 'legacy'
+        except (OSError,ValueError):
+            logging.warning('Private coin menu bundle unavailable')
+            return 'legacy'
+
+    async def remove_previous_private_menu(self, message: Any) -> None:
+        try:
+            await telegram_call_with_retry(message.delete)
+        except TelegramError:
+            logging.warning('Destination sent; could not remove the previous private menu')
+
+    async def try_replace_with_coin_menu(self, query: Any, language: str) -> bool:
+        if query.message is None:
+            return False
+        opened=await self.try_open_coin_menu(query.message.chat.id,language)
+        if opened=='sent':
+            await self.remove_previous_private_menu(query.message)
+        return opened!='legacy'
+
+    async def edit_private_menu_message(self, query: Any, text: str, **kwargs) -> Any:
+        message=query.message
+        if message is not None and (getattr(message,'widget',None) is not None
+                or 'widget' in (getattr(message,'api_kwargs',None) or {})):
+            # Widgets have no editable text. Retain the old menu until its
+            # destination exists; plain text screens keep same-message edits.
+            try:
+                sent=await telegram_call_with_retry(lambda:message.reply_text(text,**kwargs))
+            except BadRequest:
+                raise
+            except NetworkError:
+                # Telegram may already have accepted the destination. Do not
+                # enter the caller's error-message fallback and duplicate it.
+                logging.warning('Private destination delivery uncertain; previous menu retained')
+                return None
+            await self.remove_previous_private_menu(message)
+            return sent
+        return await query.edit_message_text(text,**kwargs)
+
+    def price_widget_controller(self):
+        controller = getattr(self, '_price_widget_controller', None)
+        if controller is None:
+            from chart_data import ChartDataService
+            from chart_widget_controller import ChartWidgetController
+            from chart_widget_state import ChartWidgetSessionStore
+            controller = ChartWidgetController(
+                transport=WidgetTransport(self.token),
+                data=ChartDataService(stale_max_age_seconds=self.settings.chart_stale_max_age_seconds),
+                users=self.user_alert_store,
+                sessions=ChartWidgetSessionStore(self.settings.user_state_path.with_name('price_widget_sessions.sqlite3')),
+                snapshots=self.snapshot_manager,
+                identity_valid=lambda: self.price_identity_check is not None and self.price_identity_check.valid is True,
+                queries_enabled=self.settings.price_widget_queries_enabled,
+                cooldown_seconds=self.settings.ui_refresh_cooldown_seconds,
+                stale_max_age_seconds=self.settings.chart_stale_max_age_seconds,
+            )
+            self._price_widget_controller = controller
+        return controller
+
+    async def try_open_price_widget(self, chat_id: int, language: str) -> str:
+        if not self.settings.price_widgets_enabled:
+            return 'legacy'
+        from chart_source import ChartSourceError
+        try:
+            await self.price_widget_controller().open(chat_id, language)
+            return 'sent'
+        except WidgetApiError as exc:
+            logging.warning('Private price widget open failed kind=%s unknown=%s', exc.kind, exc.unknown)
+            return 'uncertain' if exc.unknown else 'legacy'
+        except (ChartSourceError, ValueError):
+            logging.warning('Private price widget source/bundle unavailable')
+            return 'legacy'
+
+    def farming_widget_controller(self):
+        controller = getattr(self, '_farming_widget_controller', None)
+        if controller is None:
+            from farming_widget_controller import FarmingWidgetController
+            from chart_widget_state import ChartWidgetSessionStore
+            controller = FarmingWidgetController(
+                transport=WidgetTransport(self.token), history=self.farming_history_store,
+                snapshots=self.snapshot_manager,
+                sessions=ChartWidgetSessionStore(self.settings.user_state_path.with_name('farming_widget_sessions.sqlite3')),
+                queries_enabled=True, cooldown_seconds=self.settings.ui_refresh_cooldown_seconds,
+            )
+            self._farming_widget_controller = controller
+        return controller
+
+    async def try_open_farming_widget(self, chat_id: int, language: str) -> str:
+        if not self.settings.farming_widgets_enabled or self.farming_history_store is None:
+            return 'legacy'
+        try:
+            await self.farming_widget_controller().open(chat_id, language)
+            return 'sent'
+        except WidgetApiError as exc:
+            logging.warning('Private farming widget open failed kind=%s unknown=%s', exc.kind, exc.unknown)
+            return 'uncertain' if exc.unknown else 'legacy'
+        except (ValueError, OSError):
+            logging.warning('Private farming widget data/bundle unavailable')
+            return 'legacy'
+
+    async def widget_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = parse_widget_query(update)
+        if query is not None:
+            if query.data.startswith('fw1:') and self.settings.farming_widgets_enabled:
+                await self.farming_widget_controller().handle(query)
+                return
+            if query.data.startswith('p1:') and self.settings.price_widgets_enabled:
+                await self.price_widget_controller().handle(query)
+                return
+        raw = raw_widget_query(update)
+        if raw and isinstance(raw.get('id'), str):
+            try:
+                await WidgetTransport(self.token).answer(raw['id'], '{"status":"reopen"}')
+            except WidgetApiError:
+                logging.warning('Could not answer inactive widget query')
+
+    async def widget_inline_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        query = callback_for_queue(update.callback_query)
+        if query is None:
+            return
+        if not private_callback_is_owned(query) or not self.settings.price_widgets_enabled:
+            await query.answer(translate('ru', 'callback.chart_reopen'))
+            return
+        where = WidgetMessageContext(query.message.chat.id, query.message.message_id, query.from_user.id)
+        controller = self.price_widget_controller()
+        session = controller.sessions.get(where)
+        if session is None:
+            await query.answer(translate('ru', 'callback.chart_reopen'))
+            return
+        async def answer(value):
+            status = json.loads(value).get('status')
+            language = self.user_alert_store.get_user(query.from_user.id).get('language') or 'ru'
+            await query.answer('' if status == 'pending' else translate(language, 'widget.' + (status or 'error')))
+        parsed = ChartWidgetQuery(query.id, query.from_user.id, where,
+            'p1:' + query.data.removeprefix('wchart:') + ':' + str(session.revision))
+        await controller.handle(parsed, answer=answer)
+
     def __init__(self) -> None:
         self.settings = load_settings()
         self.started_at = datetime.now(timezone.utc)
@@ -603,6 +788,8 @@ class PoolmasterBot:
             await self.send_language_prompt(message)
             return
         language = normalize_language(language)
+        if screen == 'home' and await self.try_open_coin_menu(user.id,language) != 'legacy':
+            return
         snapshot = await self.snapshot_manager.get_snapshot()
         if user_state is not None:
             user_state = self.user_alert_store.seed_missing_baselines(user.id, snapshot)
@@ -638,7 +825,7 @@ class PoolmasterBot:
         user_id = query.from_user.id
         user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
         is_paused = self.user_alert_store.is_user_paused(user_state)
-        await query.edit_message_text(
+        await self.edit_private_menu_message(query,
             render_user_screen(
                 screen,
                 snapshot,
@@ -671,6 +858,16 @@ class PoolmasterBot:
             return
         if self.farming_history_store is None:
             raise RuntimeError("Farming history storage is unavailable")
+        if self.settings.farming_widgets_enabled:
+            opened = await self.try_open_farming_widget(message.chat.id, language)
+            if opened == 'sent':
+                try:
+                    await telegram_call_with_retry(message.delete)
+                except TelegramError:
+                    logging.warning('Farming widget sent; previous menu retained')
+                return
+            if opened == 'uncertain':
+                return
         await self.snapshot_manager.get_snapshot()
         if getattr(self.snapshot_manager, "last_history_write_error", None) is not None:
             await telegram_call_with_retry(
@@ -715,6 +912,9 @@ class PoolmasterBot:
         if message is None:
             return
         user_id = query.from_user.id
+        controller = getattr(self, '_farming_widget_controller', None)
+        if controller is not None:
+            await controller.close(WidgetMessageContext(message.chat.id, message.message_id, user_id))
         snapshot = await self.snapshot_manager.get_snapshot()
         user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
         text = render_user_screen(
@@ -737,11 +937,11 @@ class PoolmasterBot:
             )
         )
 
-    def register_private_interaction(self, update: Update) -> None:
+    async def register_private_interaction(self, update: Update) -> None:
         user = getattr(update, "effective_user", None)
         chat = getattr(update, "effective_chat", None)
         if user and chat and chat.type == "private" and chat.id == user.id:
-            self.user_alert_store.reactivate_user(user)
+            await self.user_alert_store.reactivate_user_async(user)
 
     async def send_chart_reply(
         self,
@@ -781,12 +981,15 @@ class PoolmasterBot:
             return
         self.stats_store.track(update, "price")
         if chat.type == "private":
-            self.register_private_interaction(update)
+            await self.register_private_interaction(update)
             user_state = self.user_alert_store.ensure_user(update.effective_user.id)
             if user_state.get("language") is None:
                 await self.send_language_prompt(message)
                 return
-            await self.send_chart_reply(message, "1h", language=user_state.get("language", "ru"))
+            language = user_state.get('language', 'ru')
+            if await self.try_open_price_widget(chat.id, language) != 'legacy':
+                return
+            await self.send_chart_reply(message, "1h", language=language)
             return
         await self.send_chart_reply(message, "1h", include_keyboard=False)
 
@@ -802,11 +1005,11 @@ class PoolmasterBot:
                 lambda: message.reply_text("Личные настройки доступны только в личном чате с POOLMASTER.")
             )
             return
-        self.register_private_interaction(update)
+        await self.register_private_interaction(update)
         await self.send_user_screen(update, "alerts")
 
     async def user_ui_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
+        query = callback_for_queue(update.callback_query)
         if not query:
             return
         user_id = query.from_user.id
@@ -815,13 +1018,13 @@ class PoolmasterBot:
         if not private_callback_is_owned(query):
             await query.answer(translate(language, "callback.owner"), show_alert=True)
             return
-        user_state = self.user_alert_store.reactivate_user(query.from_user)
+        user_state = await self.user_alert_store.reactivate_user_async(query.from_user)
         data = query.data or ""
 
         if data == "ui:language":
             await query.answer()
             if query.message:
-                await query.edit_message_text(
+                await self.edit_private_menu_message(query,
                     render_language_screen(language),
                     parse_mode=ParseMode.HTML,
                     reply_markup=private_user_keyboard("language", language=language),
@@ -838,9 +1041,11 @@ class PoolmasterBot:
                 await self.set_user_command_scope(context.bot, user_id, language)
             await query.answer(translate(language, "language.saved"))
             if query.message:
+                if await self.try_replace_with_coin_menu(query,language):
+                    return
                 snapshot = await self.snapshot_manager.get_snapshot()
                 user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
-                await query.edit_message_text(
+                await self.edit_private_menu_message(query,
                     render_user_screen(
                         "home",
                         snapshot,
@@ -857,7 +1062,7 @@ class PoolmasterBot:
         if user_state.get("language") is None:
             await query.answer(render_language_prompt())
             if query.message:
-                await query.edit_message_text(
+                await self.edit_private_menu_message(query,
                     render_language_prompt(),
                     reply_markup=private_user_keyboard("language"),
                     disable_web_page_preview=True,
@@ -939,6 +1144,16 @@ class PoolmasterBot:
                 await query.answer(translate(language, "callback.chart_refreshing"))
             else:
                 await query.answer()
+            if query.message and self.settings.price_widgets_enabled:
+                opened = await self.try_open_price_widget(query.message.chat.id, language)
+                if opened == 'sent':
+                    try:
+                        await telegram_call_with_retry(query.message.delete)
+                    except TelegramError:
+                        logging.warning('Widget sent; could not remove the previous menu')
+                    return
+                if opened == 'uncertain':
+                    return
             try:
                 if is_chart_refresh:
                     if language == "ru":
@@ -1011,7 +1226,7 @@ class PoolmasterBot:
                             "message_id": query.message.message_id if query.message else None,
                         }
                     if query.message:
-                        await query.edit_message_text(
+                        await self.edit_private_menu_message(query,
                             translate(language, prompt_key),
                             reply_markup=private_user_keyboard("alert_input", language=language),
                             disable_web_page_preview=True,
@@ -1181,6 +1396,8 @@ class PoolmasterBot:
         else:
             await query.answer()
         try:
+            if screen == 'home' and await self.try_replace_with_coin_menu(query,language):
+                return
             if snapshot is None:
                 if force and screen in {"farming", "alert_yield"}:
                     snapshot = await self.snapshot_manager.refresh_farming()
@@ -1190,7 +1407,7 @@ class PoolmasterBot:
                     snapshot = await self.snapshot_manager.get_snapshot()
             user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
             is_paused = self.user_alert_store.is_user_paused(user_state)
-            await query.edit_message_text(
+            await self.edit_private_menu_message(query,
                 render_user_screen(
                     screen,
                     snapshot,
@@ -1267,7 +1484,7 @@ class PoolmasterBot:
         await self.delete_command_message(update)
         if update.effective_chat.type == "private":
             self.stats_store.track(update, "start")
-            self.register_private_interaction(update)
+            await self.register_private_interaction(update)
             if self.is_private_admin(update):
                 await self.set_admin_command_scope(context.bot, update.effective_user.id)
             else:
@@ -1289,7 +1506,7 @@ class PoolmasterBot:
             return
         self.stats_store.track(update, "farming")
         if chat.type == "private":
-            self.register_private_interaction(update)
+            await self.register_private_interaction(update)
         await self.send_farming_info(update)
 
     async def price_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1317,7 +1534,7 @@ class PoolmasterBot:
         )
 
     async def inline_price_callback(self, update: Update, _: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
+        query = callback_for_queue(update.callback_query)
         if not query or query.data != "inline:price:refresh":
             return
         if not query.inline_message_id:
@@ -1381,7 +1598,7 @@ class PoolmasterBot:
         if not self.cooldowns.allow(("chart_command", chat.id), CHART_COMMAND_COOLDOWN_SECONDS):
             return
         self.stats_store.track(update, "chart")
-        self.register_private_interaction(update)
+        await self.register_private_interaction(update)
         user_state = self.user_alert_store.ensure_user(update.effective_user.id)
         if user_state.get("language") is None:
             await self.send_language_prompt(update.effective_message)
@@ -1398,7 +1615,7 @@ class PoolmasterBot:
             )
 
     async def chart_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
+        query = callback_for_queue(update.callback_query)
         if not query or not query.data:
             return
         user_id = query.from_user.id
@@ -1407,7 +1624,7 @@ class PoolmasterBot:
         if not private_callback_is_owned(query):
             await query.answer(translate(language, "private.chart_only"), show_alert=True)
             return
-        user_state = self.user_alert_store.reactivate_user(query.from_user)
+        user_state = await self.user_alert_store.reactivate_user_async(query.from_user)
         if user_state.get("language") is None:
             await query.answer(render_language_prompt())
             if query.message:
@@ -1443,26 +1660,33 @@ class PoolmasterBot:
                 message = query.message
                 if message is None:
                     return
+                opened=await self.try_open_coin_menu(message.chat.id,language)
+                if opened=='uncertain':
+                    return
+                if opened=='legacy':
+                    snapshot = await self.snapshot_manager.get_snapshot()
+                    user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
+                    await telegram_call_with_retry(
+                        lambda: context.bot.send_message(
+                            chat_id=message.chat.id,
+                            text=render_user_screen(
+                                "home",
+                                snapshot,
+                                invalid_pool_ids=self.invalid_pool_ids,
+                                global_paused=self.admin_state_store.is_global_auto_push_paused(),
+                                user_state=user_state,
+                                language=language,
+                            ),
+                            parse_mode=ParseMode.HTML,
+                            reply_markup=private_user_keyboard("home", language=language),
+                            disable_web_page_preview=True,
+                        )
+                    )
+                controller = getattr(self, '_price_widget_controller', None)
+                if controller is not None:
+                    controller.sessions.close(WidgetMessageContext(message.chat.id, message.message_id, user_id))
                 await telegram_call_with_retry(
                     lambda: context.bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-                )
-                snapshot = await self.snapshot_manager.get_snapshot()
-                user_state = self.user_alert_store.seed_missing_baselines(user_id, snapshot)
-                await telegram_call_with_retry(
-                    lambda: context.bot.send_message(
-                        chat_id=message.chat.id,
-                        text=render_user_screen(
-                            "home",
-                            snapshot,
-                            invalid_pool_ids=self.invalid_pool_ids,
-                            global_paused=self.admin_state_store.is_global_auto_push_paused(),
-                            user_state=user_state,
-                            language=language,
-                        ),
-                        parse_mode=ParseMode.HTML,
-                        reply_markup=private_user_keyboard("home", language=language),
-                        disable_web_page_preview=True,
-                    )
                 )
             except TelegramError:
                 logging.exception("Could not return from chart to home screen")
@@ -1612,6 +1836,15 @@ class PoolmasterBot:
                     continue
 
             now = datetime.now(timezone.utc)
+            try:
+                complete = self.farming_history_store.has_confirmed_day(now.date())
+            except Exception:
+                logging.exception("Checking daily farming history coverage failed")
+                complete = False
+            if not complete:
+                logging.warning("Daily farming history is incomplete; retrying in 300 seconds")
+                await asyncio.sleep(300)
+                continue
             next_run = datetime.combine(
                 now.date() + timedelta(days=1),
                 time(hour=0, minute=5),
@@ -2474,8 +2707,41 @@ class PoolmasterBot:
         except TelegramError:
             logging.debug("Could not remove the original broadcast input. admin_id=%s", user.id)
 
+    async def _run_manual_broadcast(self, query, context, admin_id, token):
+        try:
+            await telegram_call_with_retry(lambda:context.bot.send_message(
+                chat_id=admin_id,text="Рассылка запущена. Итог придёт отдельным сообщением."))
+        except TelegramError:
+            logging.warning('Could not show broadcast start; confirmed delivery continues')
+        result = await self.manual_push_coordinator.confirm(
+            token,
+            actor_id=admin_id,
+            admin_ids=self.admin_ids,
+            bot=context.bot,
+            users=self.user_alert_store,
+            admin_state=self.admin_state_store,
+            now=datetime.now(timezone.utc),
+        )
+        if result.status != "complete":
+            summary = "Предпросмотр истёк или уже был использован."
+        else:
+            summary = (
+                f"Отправлено: {result.delivered}\n"
+                f"Заблокировали бота: {result.blocked}\n"
+                f"Ошибки: {result.failed + result.state_failures}"
+            )
+        if query.message:
+            await telegram_call_with_retry(lambda: query.message.delete())
+        await telegram_call_with_retry(
+            lambda: context.bot.send_message(
+                chat_id=admin_id,
+                text=summary,
+                reply_markup=admin_keyboard("push_done"),
+            )
+        )
+
     async def admin_ui_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        query = update.callback_query
+        query = callback_for_queue(update.callback_query)
         if not query:
             return
         if not self._admin_callback_is_owned(query):
@@ -2714,32 +2980,14 @@ class PoolmasterBot:
                     )
                 return
             if len(parts) == 4 and parts[:2] == ["admin", "push"] and parts[2] == "confirm":
-                result = await self.manual_push_coordinator.confirm(
-                    parts[3],
-                    actor_id=admin_id,
-                    admin_ids=self.admin_ids,
-                    bot=context.bot,
-                    users=self.user_alert_store,
-                    admin_state=self.admin_state_store,
-                    now=datetime.now(timezone.utc),
-                )
-                if result.status != "complete":
-                    summary = "Предпросмотр истёк или уже был использован."
-                else:
-                    summary = (
-                        f"Отправлено: {result.delivered}\n"
-                        f"Заблокировали бота: {result.blocked}\n"
-                        f"Ошибки: {result.failed + result.state_failures}"
-                    )
-                if query.message:
-                    await telegram_call_with_retry(lambda: query.message.delete())
-                await telegram_call_with_retry(
-                    lambda: context.bot.send_message(
-                        chat_id=admin_id,
-                        text=summary,
-                        reply_markup=admin_keyboard("push_done"),
-                    )
-                )
+                active=getattr(self,'_manual_broadcast_task',None)
+                if active is not None and not active.done():
+                    await telegram_call_with_retry(lambda:context.bot.send_message(
+                        chat_id=admin_id,text="Рассылка уже выполняется. Дождитесь итогового сообщения."))
+                    return
+                self._manual_broadcast_task=context.application.create_work_task(
+                    self._run_manual_broadcast(query,context,admin_id,parts[3]),
+                    update=update,name='poolmaster:manual-broadcast')
                 return
             await query.edit_message_text(
                 "Неизвестное действие админ-панели.",
@@ -2799,16 +3047,27 @@ class PoolmasterBot:
                 ("farming-history", self.farming_history_loop(application)),
             )
 
-        application = (
+        work_limit=self.settings.update_concurrency
+        processor=KeyedUpdateProcessor(work_limit)
+        logging.info("User processing configured work_limit=%s telegram_pool=%s",work_limit,max(32,work_limit+8))
+        builder = (
             ApplicationBuilder()
+            .concurrent_updates(processor)
+            .connection_pool_size(max(32,work_limit+8))
+            .pool_timeout(10)
             .token(self.token)
             .application_class(
                 PoolmasterApplication,
                 kwargs={"background_task_factory": background_task_factory},
             )
             .post_init(self.post_init)
-            .build()
         )
+        if self.settings.price_widget_beta_updates or self.settings.farming_widgets_enabled:
+            builder = builder.get_updates_request(WidgetUpdatesRequest(beta=True, read_timeout=30))
+        application = builder.build()
+        processor.bind(application)
+        application.add_handler(WidgetQueryHandler(self.widget_query))
+        application.add_handler(CallbackQueryHandler(self.widget_inline_callback, pattern=r'^wchart:'))
         application.add_handler(CommandHandler("start", self.start))
         application.add_handler(CommandHandler("price", self.price_command))
         application.add_handler(CommandHandler("farming", self.farming))
@@ -2836,7 +3095,10 @@ class PoolmasterBot:
     def run(self) -> None:
         application = self.build_application()
         logging.info("POOLMASTER bot is running. Open Telegram and send /farming to @%s.", self.bot_username)
-        application.run_polling()
+        if self.settings.price_widgets_enabled or self.settings.price_widget_beta_updates or self.settings.farming_widgets_enabled:
+            application.run_polling(allowed_updates=[*Update.ALL_TYPES, 'widget_query'])
+        else:
+            application.run_polling()
 
 
 def main() -> None:

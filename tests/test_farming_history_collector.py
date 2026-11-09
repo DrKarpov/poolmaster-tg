@@ -27,7 +27,7 @@ def test_daily_history_loop_refreshes_while_posting_is_paused(monkeypatch):
     bot.settings = SimpleNamespace(global_auto_push_paused=True)
     bot.admin_state_store = SimpleNamespace(is_global_auto_push_paused=lambda: True)
     bot.snapshot_manager = SnapshotReader()
-    bot.farming_history_store = object()
+    bot.farming_history_store = SimpleNamespace(has_confirmed_day=lambda day: True)
 
     async def cancel_after_cycle(delay):
         delays.append(delay)
@@ -104,7 +104,7 @@ def test_daily_history_loop_retries_persistence_before_fetching_again(monkeypatc
     bot.settings = SimpleNamespace(global_auto_push_paused=True)
     bot.admin_state_store = SimpleNamespace(is_global_auto_push_paused=lambda: True)
     bot.snapshot_manager = manager
-    bot.farming_history_store = object()
+    bot.farming_history_store = SimpleNamespace(has_confirmed_day=lambda day: True)
 
     async def cancel_after_retry(delay):
         delays.append(delay)

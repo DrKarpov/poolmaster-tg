@@ -477,3 +477,19 @@ def test_manual_farming_push_fingerprint_persists_per_user(tmp_path):
     reopened = UserAlertStore(path)
     assert reopened.has_manual_farming_push(123, "card-hash") is True
     assert reopened.get_user(123)["last_manual_farming_push_at"] == NOW.isoformat()
+
+
+def test_simultaneous_private_interactions_share_one_durable_registration_write(tmp_path,monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    store=UserAlertStore(tmp_path/'users.json')
+    writes=[];save=store._save
+    def observed_save():writes.append(1);save()
+    monkeypatch.setattr(store,'_save',observed_save)
+    async def run():
+        return await asyncio.gather(*(store.reactivate_user_async(SimpleNamespace(id=i,first_name='User')) for i in range(1,301)))
+    rows=asyncio.run(run())
+    restored=UserAlertStore(tmp_path/'users.json')
+    assert len(rows)==300 and len(writes)==1
+    assert len(restored.list_registered_user_ids())==300
+    assert all(row['registered'] and row['first_seen_at'] for row in rows)

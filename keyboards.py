@@ -10,6 +10,19 @@ from farming import FARMING_POOLS
 from localization import normalize_language, translate
 
 
+def price_widget_keyboard(language: str = 'ru', timeframe: str = '1h', *, interactive: bool = True) -> InlineKeyboardMarkup:
+    from chart_data import WIDGET_TIMEFRAMES, FRAME_LABELS
+    language = normalize_language(language)
+    rows = []
+    if not interactive:
+        rows.append([InlineKeyboardButton(('• ' if frame == timeframe else '') + label,
+            callback_data='wchart:tf:' + frame)
+            for frame, label in zip(WIDGET_TIMEFRAMES, FRAME_LABELS[language])])
+        rows.append([InlineKeyboardButton(translate(language, 'chart.button.refresh'), callback_data='wchart:refresh')])
+    rows.append([InlineKeyboardButton(translate(language, 'chart.button.back'), callback_data='chart:back', style='danger')])
+    return InlineKeyboardMarkup(rows)
+
+
 def build_destination_add_link(bot_username: str, destination_type: str) -> str:
     """Build a Telegram-native add link with only the required suggested right."""
     if destination_type not in {"channel", "group"}:

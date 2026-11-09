@@ -1,0 +1,83 @@
+<style>
+#jetton-coin-concept{max-width:430px;margin:0 auto;background:#1B2744;border:1px solid #14A7E8;border-radius:12px;overflow:hidden}
+#jetton-coin-concept button{display:block;width:100%;padding:0;margin:0;border:0;border-radius:12px;background:transparent;color:#F3F8FA;opacity:1;touch-action:pan-y}
+#jetton-coin-concept canvas{display:block;width:100%;height:auto;aspect-ratio:1}
+</style>
+<div id="jetton-coin-concept">
+  <button type="button" class="cursor-interaction" aria-label="Подбросить монетку TST">
+    <canvas aria-hidden="true"></canvas>
+  </button>
+</div>
+<script>
+(()=>{
+  const root=document.getElementById('jetton-coin-concept');
+  const button=root.querySelector('button'),canvas=root.querySelector('canvas'),ctx=canvas.getContext('2d');
+  const logo=new Path2D('M4 8H36V16H24V48H16V16H4ZM76 8H44V32H68V40H44V48H76V24H52V16H76ZM84 8H116V16H104V48H96V16H84Z');
+  let width=320,side=0,chosen=0,busy=false,started=0,raf=0,angle=0,lift=0,glow=0,squash=1,from=0,to=0,landed=false;
+  const circle=(x,y,r,fill)=>{ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fillStyle=fill;ctx.fill()};
+  function draw(){
+    const d=Math.min(window.devicePixelRatio||1,2);
+    const scale=width/240;
+    ctx.setTransform(d*scale,0,0,d*scale,0,0);ctx.clearRect(0,0,240,240);
+    const spread=1-lift/110,shade=ctx.createRadialGradient(0,0,1,0,0,65);
+    shade.addColorStop(0,'rgba(3,12,24,.55)');shade.addColorStop(1,'rgba(3,12,24,0)');
+    ctx.save();ctx.translate(120,221);ctx.scale(spread,.14*spread);circle(0,0,65,shade);ctx.restore();
+    ctx.save();ctx.translate(120,139-lift);ctx.rotate(-.1*Math.sin(lift/45*Math.PI/2));ctx.scale(1.65,1.65);
+    const face=Math.cos(angle),thin=Math.max(.035,Math.abs(face));
+    ctx.save();ctx.translate(3,3);ctx.scale(thin,squash);circle(0,0,46,'#8C581B');ctx.restore();
+    ctx.scale(thin,squash);
+    const rim=ctx.createLinearGradient(-38,-44,38,44);
+    rim.addColorStop(0,'#FFF0AF');rim.addColorStop(.23,'#E2B64F');rim.addColorStop(.48,'#98601C');rim.addColorStop(.75,'#FFE29A');rim.addColorStop(1,'#A86D20');
+    circle(0,0,46,rim);circle(0,0,42,'#936322');circle(0,0,40.5,rim);
+    const metal=ctx.createLinearGradient(-26,-40,28,40);
+    metal.addColorStop(0,'#E9C468');metal.addColorStop(.34,'#F4D780');metal.addColorStop(.58,'#D5A33C');metal.addColorStop(1,'#AE7827');
+    circle(0,0,39,metal);
+    if(face>=0){
+      const bevel=.96*thin;
+      ctx.save();ctx.translate(-27,-12.6);ctx.scale(54/120,54/120);ctx.translate(0,bevel);ctx.fillStyle='#936021';ctx.fill(logo,'evenodd');
+      ctx.translate(0,-bevel);ctx.fillStyle='#FFEAA2';ctx.fill(logo,'evenodd');ctx.restore();
+    }
+    if(glow>0){
+      const sweep=58*Math.sin(angle*.65+.5),shine=ctx.createLinearGradient(sweep-34,-42,sweep+34,42);
+      const light=.66*glow*(.4+.6*thin);
+      shine.addColorStop(0,'rgba(255,248,216,0)');shine.addColorStop(.18,'rgba(255,248,216,0)');
+      shine.addColorStop(.5,'rgba(255,248,216,'+light+')');shine.addColorStop(.82,'rgba(255,248,216,0)');shine.addColorStop(1,'rgba(255,248,216,0)');
+      ctx.save();ctx.beginPath();ctx.arc(0,0,46,0,Math.PI*2);ctx.clip();ctx.fillStyle=shine;ctx.fillRect(-46,-46,92,92);ctx.restore();
+    }
+    ctx.restore();
+  }
+  function fit(){
+    width=Math.max(100,canvas.getBoundingClientRect().width||320);
+    const d=Math.min(window.devicePixelRatio||1,2);
+    canvas.width=canvas.height=Math.round(width*d);draw();
+  }
+  function finish(){
+    cancelAnimationFrame(raf);raf=0;side=chosen;angle=side*Math.PI;lift=glow=0;squash=1;busy=false;
+    root.setAttribute('data-side',String(side));button.setAttribute('aria-busy','false');
+    button.setAttribute('aria-label',(side?'Гладкая сторона.':'Логотип TST.')+' Подбросить монетку');draw();
+  }
+  function impact(style){
+    if(document.hidden)return;
+    try{window.TelegramWidget?.HapticFeedback?.impactOccurred(style)}catch{}
+  }
+  function frame(now){
+    if(!busy)return;
+    const elapsed=now-started,t=Math.min(1,elapsed/940);
+    angle=from+(to-from)*(1-Math.pow(1-t,1.18));lift=45*4*t*(1-t);squash=1;
+    glow=t<1?Math.sin(Math.PI*t)**2:0;
+    if(elapsed>=940){if(!landed){landed=true;impact('medium')}const s=Math.min(1,(elapsed-940)/180);lift=5*Math.sin(s*Math.PI)}
+    draw();if(elapsed>=1120)finish();else raf=requestAnimationFrame(frame);
+  }
+  button.onclick=()=>{
+    if(busy)return;
+    chosen=crypto.getRandomValues(new Uint8Array(1))[0]&1;
+    busy=true;landed=false;impact('light');button.setAttribute('aria-busy','true');
+    from=side*Math.PI;to=6*Math.PI+chosen*Math.PI;
+    started=performance.now();
+    if(matchMedia('(prefers-reduced-motion: reduce)').matches)finish();else raf=requestAnimationFrame(frame);
+  };
+  document.addEventListener('visibilitychange',()=>{if(document.hidden&&busy)finish()});
+  new ResizeObserver(fit).observe(canvas);fit();
+  root.setAttribute('data-side','0');window.TelegramWidget?.ready();
+})();
+</script>
